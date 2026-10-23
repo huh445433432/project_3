@@ -1,0 +1,252 @@
+
+ Cкрипт для парсинга вб в файл json : Бренд:, Кол-отзывов:, Рейтинг:, Название, Цена:, Цена без скидки ,Cсылка на товар
+
+
+import json ,time
+from contextlib import contextmanager
+import undetected_chromedriver as uc
+
+
+@contextmanager
+def get_driver(version_main=None):
+    options = uc.ChromeOptions()
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    driver = uc.Chrome(options=options, version_main=version_main)
+    try:
+        yield driver
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+
+def inject_interceptor(driver):
+    """Внедряет JS-перехватчик fetch/XHR ДО загрузки страницы."""
+    script = r"""
+    window._wb_responses = [];
+
+    const originalFetch = window.fetch;
+    window.fetch = async function(...args) {
+        const response = await originalFetch.apply(this, args);
+        try {
+            const url = typeof args[0] === 'string'
+                ? args[0]
+                : (args[0] && args[0].url) || '';
+            if (url.includes('catalog') || url.includes('search')) {
+                const clone = response.clone();
+                const data = await clone.json();
+                window._wb_responses.push({url: url, data: data});
+            }
+        } catch(e) {}
+        return response;
+    };
+
+    const originalXHROpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        this._wb_url = url;
+        originalXHROpen.apply(this, [method, url, ...rest]);
+    };
+    const originalXHRSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function(...args) {
+        this.addEventListener('load', function() {
+            try {
+                if (this._wb_url &&
+                    (this._wb_url.includes('catalog') || this._wb_url.includes('search'))) {
+                    const data = JSON.parse(this.responseText);
+                    window._wb_responses.push({url: this._wb_url, data: data});
+                }
+            } catch(e) {}
+        });
+        originalXHRSend.apply(this, args);
+    };
+    """
+    try:
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument", {"source": script}
+        )
+    except Exception as e:
+        print(f"Не удалось внедрить перехватчик через CDP: {e}")
+
+
+def extract_products_from_responses(driver):
+    """Достаёт данные о товарах из перехваченных API-ответов."""
+    responses = driver.execute_script("return window._wb_responses || [];")
+    products = []
+    for resp in responses:
+        data = resp.get("data", {})
+        prods = data.get("products", [])
+        if not prods and isinstance(data.get("data"), dict):
+            prods = data["data"].get("products", [])
+        if prods:
+            products.extend(prods)
+    return products
+
+
+def fetch_api_directly(driver, query="брюки мужские", pages=3):
+    """Запрос к WB search API напрямую из контекста браузера."""
+    all_products = []
+    for page in range(1, pages + 1):
+        result = driver.execute_async_script(f"""
+        const callback = arguments[arguments.length - 1];
+        fetch(
+            "https://search.wb.ru/exactmatch/ru/common/v18/search"
+            + "?appType=1&curr=rub&dest=-1257786&lang=ru"
+            + "&page={page}&query={query}"
+            + "&resultset=catalog&sort=popular&spp=30"
+        )
+        .then(r => r.json())
+        .then(data => callback(data))
+        .catch(e => callback({{error: e.toString()}}));
+        """)
+        if result and "error" in result:
+            print(f"  Ошибка на странице {page}: {result['error']}")
+            break
+        if not result or not result.get("products"):
+            break
+        all_products.extend(result["products"])
+        print(f"  Страница {page}: получено {len(result['products'])} товаров")
+        time.sleep(1)
+
+    return all_products
+
+
+def get_feedbacks_count(p) -> int:
+    """Проверяет все возможные имена поля с количеством отзывов."""
+    # Все варианты имени поля, которые встречаются в API WB
+    field_names = [
+        "feedbacks",
+        "nmFeedbacks",
+        "feedbackCount",
+        "feedbacksCount",
+        "reviewCount",
+        "reviews",
+    ]
+    for name in field_names:
+        val = p.get(name)
+        if val is not None and val != 0:
+            return val
+    # Если все нули — всё равно возвращаем 0
+    for name in field_names:
+        val = p.get(name)
+        if val is not None:
+            return val
+    return 0
+
+
+def parse_products(raw_products, debug_fields=False):
+    """Преобразует сырые JSON-данные в удобный список."""
+    products = []
+    seen_ids = set()
+
+    for idx, p in enumerate(raw_products):
+        pid = p.get("id")
+        if not pid or pid in seen_ids:
+            continue
+        seen_ids.add(pid)
+
+        # Отладка: выводим все ключи первого товара
+        if debug_fields and idx == 0:
+            print(f"\n--- ОТЛАДКА: ключи первого товара ---")
+            for k, v in sorted(p.items()):
+                print(f"  {k}: {repr(v)[:120]}")
+            print(f"--- конец отладки ---\n")
+
+        # Цена
+        price_raw = 0
+        basic_price = 0
+        sizes = p.get("sizes", [])
+        if sizes:
+            price_raw = sizes[0].get("price", {}).get("product", 0)
+            basic_price = sizes[0].get("price", {}).get("basic", 0)
+        price = round(price_raw / 100, 2) if price_raw else 0
+        basic_price = round(basic_price / 100, 2) if basic_price else 0
+
+        reviews_count = get_feedbacks_count(p)
+
+        products.append({
+            "id": pid,
+            "brand": p.get("brand", ""),
+            "name": p.get("name", ""),
+            "price": price,
+            "basic_price": basic_price,
+            "rating": p.get("rating", 0),
+            "reviews_count": reviews_count,
+            "link": f"https://www.wildberries.ru/catalog/{pid}/detail.aspx",
+        })
+
+    return products
+
+def main():
+    url = "https://www.wildberries.ru/catalog/muzhchinam/odezhda/bryuki-i-shorty"
+
+    with get_driver(version_main=154) as driver:
+        inject_interceptor(driver)
+
+        driver.get(url)
+        time.sleep(5)
+
+        # Прокрутка
+        for i in range(5):
+            driver.execute_script("window.scrollBy(0, 1500);")
+            time.sleep(2)
+
+        # Перехваченные товары
+        raw_products = extract_products_from_responses(driver)
+        print(f"Перехвачено товаров из API: {len(raw_products)}")
+
+        # Fallback: прямой запрос
+        if not raw_products:
+            print("Перехват не дал результатов. Пробуем прямой запрос к API...")
+            raw_products = fetch_api_directly(driver, query="брюки мужские", pages=3)
+
+        if not raw_products:
+            print("Товары не найдены!")
+            with open("debug_page.html", "w", encoding="utf-8") as f:
+                f.write(driver.page_source)
+            print("HTML сохранён в debug_page.html")
+            urls = driver.execute_script(
+                "return (window._wb_responses || []).map(r => r.url);"
+            )
+            if urls:
+                print("Перехваченные URL:")
+                for u in urls:
+                    print(f"  {u}")
+            return
+
+        # Парсим с отладкой полей
+        products = parse_products(raw_products, debug_fields=True)
+
+        # Проверяем, есть ли товары с нулевыми отзывами
+        zero_reviews = sum(1 for p in products if p["reviews_count"] == 0)
+        print(f"Товаров с 0 отзывов: {zero_reviews} из {len(products)}")
+
+        # Если все отзывы нулевые — выводим полный список ключей
+        if zero_reviews == len(products) and products:
+            print("\n!!! Все отзывы равны 0. Вывожу ключи первого товара:")
+            first_raw = raw_products[0]
+            for k, v in sorted(first_raw.items()):
+                print(f"  {k}: {repr(v)[:200]}")
+
+        # Вывод
+        print(f"\nНайдено товаров: {len(products)}")
+        for i, item in enumerate(products[:20], start=1):
+            print(f"{i}. Бренд: {item['brand']}")
+            print(f" Отзывов: {item['reviews_count']}")
+            print(f" Рейтинг: {item['rating']}")
+            print(f" Название: {item['name']}")
+            print(f" Цена: {item['price']} руб")
+            if item['basic_price'] and item['basic_price'] != item['price']:
+                print(f"Цена без скидки: {item['basic_price']} руб")
+            print(f"Ссылка: {item['link']}\n")
+        if len(products) > 20:
+            print(f"... и ещё {len(products) - 20} товаров")
+            # Сохранение
+
+        with open("products.json", "w", encoding="utf-8") as f:
+            json.dump(products, f, ensure_ascii=False, indent=2)
+
+        print("Сохранено в products.json")
+
+if __name__ == "__main__":
+            main()
